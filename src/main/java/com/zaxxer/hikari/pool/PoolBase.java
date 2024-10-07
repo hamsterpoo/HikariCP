@@ -36,6 +36,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
 import java.sql.Statement;
+import java.util.StringJoiner;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -69,9 +70,10 @@ abstract class PoolBase
    private static final int UNINITIALIZED = -1;
    private static final int TRUE = 1;
    private static final int FALSE = 0;
+   private static final int MINIMUM_LOGIN_TIMEOUT = Integer.getInteger("com.zaxxer.hikari.minimumLoginTimeoutSecs", 1);
 
    private int networkTimeout;
-   private int isNetworkTimeoutSupported;
+   private volatile int isNetworkTimeoutSupported;
    private int isQueryTimeoutSupported;
    private int defaultTransactionIsolation;
    private int transactionIsolation;
@@ -96,7 +98,7 @@ abstract class PoolBase
       this.schema = config.getSchema();
       this.isReadOnly = config.isReadOnly();
       this.isAutoCommit = config.isAutoCommit();
-      this.exceptionOverride = UtilityElf.createInstance(config.getExceptionOverrideClassName(), SQLExceptionOverride.class);
+      this.exceptionOverride = config.getExceptionOverride();
       this.transactionIsolation = UtilityElf.getTransactionIsolation(config.getTransactionIsolation());
 
       this.isQueryTimeoutSupported = UNINITIALIZED;
@@ -132,7 +134,7 @@ abstract class PoolBase
             logger.debug("{} - Closing connection {}: {}", poolName, connection, closureReason);
 
             // continue with the close even if setNetworkTimeout() throws
-            try (connection; connection) {
+            try (connection) {
                if (!connection.isClosed())
                   setNetworkTimeout(connection, SECONDS.toMillis(15));
                } catch (SQLException e) {
@@ -242,6 +244,7 @@ abstract class PoolBase
 
    void shutdownNetworkTimeoutExecutor()
    {
+      isNetworkTimeoutSupported = UNINITIALIZED;
       if (netTimeoutExecutor instanceof ThreadPoolExecutor) {
          ((ThreadPoolExecutor) netTimeoutExecutor).shutdownNow();
       }
@@ -310,8 +313,7 @@ abstract class PoolBase
    private void initializeDataSource()
    {
       final var jdbcUrl = config.getJdbcUrl();
-      final var username = config.getUsername();
-      final var password = config.getPassword();
+      final var credentials = config.getCredentials();
       final var dsClassName = config.getDataSourceClassName();
       final var driverClassName = config.getDriverClassName();
       final var dataSourceJNDI = config.getDataSourceJNDI();
@@ -323,7 +325,7 @@ abstract class PoolBase
          PropertyElf.setTargetFromProperties(ds, dataSourceProperties);
       }
       else if (jdbcUrl != null && ds == null) {
-         ds = new DriverDataSource(jdbcUrl, driverClassName, dataSourceProperties, username, password);
+         ds = new DriverDataSource(jdbcUrl, driverClassName, dataSourceProperties, credentials.getUsername(), credentials.getPassword());
       }
       else if (dataSourceJNDI != null && ds == null) {
          try {
@@ -353,8 +355,9 @@ abstract class PoolBase
 
       Connection connection = null;
       try {
-         var username = config.getUsername();
-         var password = config.getPassword();
+         final var credentials = config.getCredentials();
+         final var username = credentials.getUsername();
+         final var password = credentials.getPassword();
 
          connection = (username == null) ? dataSource.getConnection() : dataSource.getConnection(username, password);
          if (connection == null) {
@@ -616,7 +619,7 @@ abstract class PoolBase
    {
       if (connectionTimeout != Integer.MAX_VALUE) {
          try {
-            dataSource.setLoginTimeout(Math.max(1, (int) MILLISECONDS.toSeconds(500L + connectionTimeout)));
+            dataSource.setLoginTimeout(Math.max(MINIMUM_LOGIN_TIMEOUT, (int) MILLISECONDS.toSeconds(500L + connectionTimeout)));
          }
          catch (Exception e) {
             logger.info("{} - Failed to set login timeout for data source. ({})", poolName, e.getMessage());
@@ -636,14 +639,13 @@ abstract class PoolBase
     */
    private String stringFromResetBits(final int bits)
    {
-      final var sb = new StringBuilder();
+      final var sb = new StringJoiner(", ");
       for (int ndx = 0; ndx < RESET_STATES.length; ndx++) {
          if ( (bits & (0b1 << ndx)) != 0) {
-            sb.append(RESET_STATES[ndx]).append(", ");
+            sb.add(RESET_STATES[ndx]);
          }
       }
 
-      sb.setLength(sb.length() - 2);  // trim trailing comma
       return sb.toString();
    }
 
